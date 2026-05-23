@@ -19,7 +19,7 @@ pip install -e .
 Install directly from Git (public repo):
 
 ```bash
-pip install "git+https://github.com/<owner>/saladProxy.git"
+pip install "git+https://github.com/thomassmith1969/saladProxy.git"
 ```
 
 ## Usage (Python)
@@ -45,7 +45,7 @@ salad-proxy <endpoint-url> <local-port> [salad-key]
 From the public Git repo:
 
 ```bash
-uvx --from "git+https://github.com/<owner>/saladProxy.git" salad-proxy <endpoint-url> <local-port> [salad-key]
+uvx --from "git+https://github.com/thomassmith1969/saladProxy.git" salad-proxy <endpoint-url> <local-port> [salad-key]
 ```
 
 From a local checkout:
@@ -65,7 +65,7 @@ uvx salad-proxy <endpoint-url> <local-port> [salad-key]
 From the public Git repo:
 
 ```bash
-pipx run --spec "git+https://github.com/<owner>/saladProxy.git" salad-proxy <endpoint-url> <local-port> [salad-key]
+pipx run --spec "git+https://github.com/thomassmith1969/saladProxy.git" salad-proxy <endpoint-url> <local-port> [salad-key]
 ```
 
 From a local checkout:
