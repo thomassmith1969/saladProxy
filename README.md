@@ -2,6 +2,26 @@
 
 Local reverse proxy that forwards requests to a fixed upstream and injects `Salad-Api-Key` on every request.
 
+## Quick Start
+
+Install from GitHub:
+
+```bash
+pip install "git+https://github.com/thomassmith1969/saladProxy.git"
+```
+
+Run local proxy to a Salad endpoint:
+
+```bash
+salad-proxy https://currant-delicata-koevuxe7nrww04ng.salad.cloud 11434
+```
+
+Send traffic through localhost:
+
+```bash
+curl -N -i http://127.0.0.1:11434/api/chat -X POST -H 'Content-Type: application/json' -d '{"model":"qwen3-coder-next:latest","messages":[{"role":"user","content":"What is deep learning?"}],"stream":true}'
+```
+
 ## Install
 
 Python package install:
