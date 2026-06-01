@@ -133,6 +133,10 @@ If no key is found, startup fails with an error.
 - If the endpoint includes a base path, local request paths are appended to that base path.
 - `CONNECT` tunneling is intentionally rejected.
 
+## License
+
+This project is licensed under the MIT License. See `LICENSE` for details.
+
 ## Exact Method Behavior
 
 - `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `HEAD`: proxied upstream with method preserved.
