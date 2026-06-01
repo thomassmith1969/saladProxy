@@ -19,8 +19,12 @@ salad-proxy https://currant-delicata-koevuxe7nrww04ng.salad.cloud 11434
 Send traffic through localhost:
 
 ```bash
-curl -N -i http://127.0.0.1:11434/api/chat -X POST -H 'Content-Type: application/json' -d '{"model":"qwen3-coder-next:latest","messages":[{"role":"user","content":"What is deep learning?"}],"stream":true}'
+curl -N -i http://127.0.0.1:11434/api/chat -X POST -H 'Content-Type: application/json' -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"What is deep learning?"}],"stream":true}'
 ```
+
+> **Important:** The local proxy listens on plain HTTP. Do not call `https://127.0.0.1:11434`; that will trigger SSL negotiation errors such as `SSL routines::wrong version number` or `Bad request version`.
+
+> **Troubleshooting:** If you see `Bad request version` or `TLS handshake received on HTTP listener`, you're sending HTTPS traffic to the local proxy. Use `http://127.0.0.1:<port>` for local requests.
 
 ## Install
 

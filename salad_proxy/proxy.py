@@ -41,6 +41,16 @@ class SaladProxyHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
+    def parse_request(self) -> bool:
+        raw = getattr(self, 'raw_requestline', b'')
+        if isinstance(raw, bytes) and raw.startswith(b'\x16\x03'):
+            self.send_error(
+                400,
+                "TLS handshake received on HTTP listener. Use http://127.0.0.1:<port> for the local proxy.",
+            )
+            return False
+        return super().parse_request()
+
     @staticmethod
     def _connection_header_tokens(headers) -> set[str]:
         raw = headers.get("Connection", "")
