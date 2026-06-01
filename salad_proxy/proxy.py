@@ -20,13 +20,20 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
-UPSTREAM_TIMEOUT_SECONDS = 300
+STREAM_CHUNK_SIZE = 8192
+DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 3600.0
 
 
 class ProxyConfig:
-    def __init__(self, upstream: SplitResult, auth_key: str) -> None:
+    def __init__(
+        self,
+        upstream: SplitResult,
+        auth_key: str,
+        upstream_timeout_seconds: float | None,
+    ) -> None:
         self.upstream = upstream
         self.auth_key = auth_key
+        self.upstream_timeout_seconds = upstream_timeout_seconds
 
 
 class SaladProxyHandler(BaseHTTPRequestHandler):
@@ -34,7 +41,50 @@ class SaladProxyHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
+    @staticmethod
+    def _connection_header_tokens(headers) -> set[str]:
+        raw = headers.get("Connection", "")
+        return {token.strip().lower() for token in raw.split(",") if token.strip()}
+
     def _read_request_body(self) -> bytes:
+        # Decode chunked uploads so we can forward a canonical body upstream.
+        transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in transfer_encoding:
+            body = bytearray()
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:
+                    break
+
+                size_token = size_line.split(b";", 1)[0].strip()
+                if not size_token:
+                    continue
+
+                try:
+                    chunk_size = int(size_token, 16)
+                except ValueError:
+                    raise ConnectionError("Invalid chunk size in request body")
+
+                if chunk_size == 0:
+                    # Read trailer section terminator and ignore trailer headers.
+                    while True:
+                        trailer_line = self.rfile.readline()
+                        if trailer_line in (b"\r\n", b"\n", b""):
+                            break
+                    break
+
+                chunk = self.rfile.read(chunk_size)
+                if len(chunk) != chunk_size:
+                    raise ConnectionError("Unexpected EOF while reading chunked body")
+                body.extend(chunk)
+
+                # Each chunk is followed by CRLF.
+                chunk_terminator = self.rfile.read(2)
+                if chunk_terminator != b"\r\n":
+                    raise ConnectionError("Malformed chunked request terminator")
+
+            return bytes(body)
+
         content_length = self.headers.get("Content-Length")
         if not content_length:
             return b""
@@ -49,12 +99,71 @@ class SaladProxyHandler(BaseHTTPRequestHandler):
 
         return self.rfile.read(length)
 
+    def _iter_request_body_chunks(self):
+        transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in transfer_encoding:
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:
+                    break
+
+                size_token = size_line.split(b";", 1)[0].strip()
+                if not size_token:
+                    continue
+
+                try:
+                    chunk_size = int(size_token, 16)
+                except ValueError as exc:
+                    raise ConnectionError("Invalid chunk size in request body") from exc
+
+                if chunk_size == 0:
+                    while True:
+                        trailer_line = self.rfile.readline()
+                        if trailer_line in (b"\r\n", b"\n", b""):
+                            break
+                    break
+
+                chunk = self.rfile.read(chunk_size)
+                if len(chunk) != chunk_size:
+                    raise ConnectionError("Unexpected EOF while reading chunked body")
+
+                chunk_terminator = self.rfile.read(2)
+                if chunk_terminator != b"\r\n":
+                    raise ConnectionError("Malformed chunked request terminator")
+
+                yield chunk
+            return
+
+        content_length = self.headers.get("Content-Length")
+        if not content_length:
+            return
+
+        try:
+            remaining = int(content_length)
+        except ValueError:
+            return
+
+        if remaining <= 0:
+            return
+
+        while remaining > 0:
+            chunk = self.rfile.read(min(STREAM_CHUNK_SIZE, remaining))
+            if not chunk:
+                raise ConnectionError("Unexpected EOF while reading request body")
+            remaining -= len(chunk)
+            yield chunk
+
     def _build_upstream_headers(self) -> dict[str, str]:
         upstream_headers: dict[str, str] = {}
+        connection_tokens = self._connection_header_tokens(self.headers)
 
         for name, value in self.headers.items():
             lowered = name.lower()
-            if lowered in HOP_BY_HOP_HEADERS or lowered == "host":
+            if (
+                lowered in HOP_BY_HOP_HEADERS
+                or lowered == "host"
+                or lowered in connection_tokens
+            ):
                 continue
             upstream_headers[name] = value
 
@@ -79,8 +188,12 @@ class SaladProxyHandler(BaseHTTPRequestHandler):
         return upstream_path
 
     def _proxy(self):
-        request_body = self._read_request_body()
-        upstream_headers = self._build_upstream_headers()
+        try:
+            upstream_headers = self._build_upstream_headers()
+        except ConnectionError as exc:
+            self.send_error(400, f"Bad request body: {exc}")
+            return
+
         upstream_url = self._build_upstream_url()
 
         connection_cls = (
@@ -97,16 +210,49 @@ class SaladProxyHandler(BaseHTTPRequestHandler):
             self.send_error(502, "Upstream host is missing")
             return
 
-        connection = connection_cls(host, port, timeout=UPSTREAM_TIMEOUT_SECONDS)
+        connection = connection_cls(
+            host,
+            port,
+            timeout=self.config.upstream_timeout_seconds,
+        )
 
         try:
             try:
-                connection.request(
-                    method=self.command,
-                    url=upstream_url,
-                    body=request_body if request_body else None,
-                    headers=upstream_headers,
-                )
+                connection.putrequest(self.command, upstream_url, skip_host=True, skip_accept_encoding=True)
+
+                if "Host" not in upstream_headers and "host" not in upstream_headers:
+                    upstream_headers["Host"] = host if port in {80, 443} else f"{host}:{port}"
+
+                body_chunks = self._iter_request_body_chunks()
+                has_content_length = self.headers.get("Content-Length") is not None
+                has_chunked_input = "chunked" in self.headers.get("Transfer-Encoding", "").lower()
+
+                if has_chunked_input and "Transfer-Encoding" not in upstream_headers and "transfer-encoding" not in {name.lower() for name in upstream_headers}:
+                    upstream_headers["Transfer-Encoding"] = "chunked"
+
+                for header_name, header_value in upstream_headers.items():
+                    connection.putheader(header_name, header_value)
+
+                connection.endheaders()
+
+                try:
+                    for chunk in body_chunks:
+                        if has_chunked_input:
+                            connection.send(f"{len(chunk):X}\r\n".encode("ascii"))
+                            connection.send(chunk)
+                            connection.send(b"\r\n")
+                        else:
+                            connection.send(chunk)
+
+                    if has_chunked_input:
+                        connection.send(b"0\r\n\r\n")
+                except ConnectionError as exc:
+                    try:
+                        self.send_error(400, f"Bad request body: {exc}")
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+
                 response = connection.getresponse()
             except (OSError, socket.timeout, http.client.HTTPException) as exc:
                 # Return a gateway error instead of dropping the client socket.
@@ -119,6 +265,11 @@ class SaladProxyHandler(BaseHTTPRequestHandler):
             self.send_response(response.status, response.reason)
 
             upstream_has_content_length = False
+            response_has_body = (
+                self.command != "HEAD"
+                and response.status not in {204, 304}
+                and not (100 <= response.status < 200)
+            )
             for header_name, header_value in response.getheaders():
                 lowered = header_name.lower()
                 if lowered in HOP_BY_HOP_HEADERS:
@@ -129,26 +280,36 @@ class SaladProxyHandler(BaseHTTPRequestHandler):
                     upstream_has_content_length = True
                 self.send_header(header_name, header_value)
 
-            # For streamed responses without Content-Length, terminate by closing.
-            if not upstream_has_content_length and self.command != "HEAD":
-                self.send_header("Connection", "close")
-                self.close_connection = True
+            # Preserve keep-alive by chunking streamed responses with unknown length.
+            should_chunk_downstream = response_has_body and not upstream_has_content_length
+            if should_chunk_downstream:
+                self.send_header("Transfer-Encoding", "chunked")
 
             self.end_headers()
             self.wfile.flush()
 
-            if self.command == "HEAD":
+            if not response_has_body:
                 return
 
             try:
                 while True:
                     if hasattr(response, "read1"):
-                        chunk = response.read1(8192)  # type: ignore[attr-defined]
+                        chunk = response.read1(STREAM_CHUNK_SIZE)  # type: ignore[attr-defined]
                     else:
-                        chunk = response.read(8192)
+                        chunk = response.read(STREAM_CHUNK_SIZE)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
+
+                    if should_chunk_downstream:
+                        self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                        self.wfile.write(chunk)
+                        self.wfile.write(b"\r\n")
+                    else:
+                        self.wfile.write(chunk)
+                    self.wfile.flush()
+
+                if should_chunk_downstream:
+                    self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 # Client disconnected while streaming response.
@@ -231,6 +392,27 @@ def resolve_auth_key(cli_key: str | None) -> str:
     )
 
 
+def resolve_upstream_timeout_seconds() -> float | None:
+    raw_timeout = os.getenv("SALAD_PROXY_UPSTREAM_TIMEOUT_SECONDS", "").strip()
+    if not raw_timeout:
+        return DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+
+    try:
+        timeout_value = float(raw_timeout)
+    except ValueError as exc:
+        raise ValueError(
+            "SALAD_PROXY_UPSTREAM_TIMEOUT_SECONDS must be a number (0 disables timeout)"
+        ) from exc
+
+    if timeout_value < 0:
+        raise ValueError("SALAD_PROXY_UPSTREAM_TIMEOUT_SECONDS must be >= 0")
+
+    if timeout_value == 0:
+        return None
+
+    return timeout_value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m salad_proxy",
@@ -261,14 +443,23 @@ def run_proxy(remote: str, local_port: int, salad_key: str | None) -> int:
     upstream = parse_upstream_endpoint(remote)
     auth_key = resolve_auth_key(salad_key)
 
-    proxy_config = ProxyConfig(upstream=upstream, auth_key=auth_key)
+    upstream_timeout_seconds = resolve_upstream_timeout_seconds()
+    proxy_config = ProxyConfig(
+        upstream=upstream,
+        auth_key=auth_key,
+        upstream_timeout_seconds=upstream_timeout_seconds,
+    )
 
     class ConfiguredHandler(SaladProxyHandler):
         pass
 
     ConfiguredHandler.config = proxy_config
 
-    server = ThreadingHTTPServer(("0.0.0.0", local_port), ConfiguredHandler)
+    class ProxyServer(ThreadingHTTPServer):
+        daemon_threads = True
+        request_queue_size = 128
+
+    server = ProxyServer(("0.0.0.0", local_port), ConfiguredHandler)
 
     upstream_netloc = upstream.netloc
     upstream_path = upstream.path or ""
