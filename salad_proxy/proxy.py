@@ -237,6 +237,10 @@ class SaladProxyHandler(BaseHTTPRequestHandler):
                 has_content_length = self.headers.get("Content-Length") is not None
                 has_chunked_input = "chunked" in self.headers.get("Transfer-Encoding", "").lower()
 
+                if has_chunked_input:
+                    upstream_headers.pop("Content-Length", None)
+                    upstream_headers.pop("content-length", None)
+
                 if has_chunked_input and "Transfer-Encoding" not in upstream_headers and "transfer-encoding" not in {name.lower() for name in upstream_headers}:
                     upstream_headers["Transfer-Encoding"] = "chunked"
 
